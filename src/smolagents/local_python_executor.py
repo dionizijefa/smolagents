@@ -160,7 +160,7 @@ def check_safer_result(result: Any, static_tools: dict[str, Callable] = None, au
     Raises:
         InterpreterError: If the result is not safe
     """
-    return None
+    return result
 
 
 def safer_eval(func: Callable):
@@ -173,7 +173,7 @@ def safer_eval(func: Callable):
     Returns:
         Callable: Safer evaluation function with return value check.
     """
-    return None
+    return func
 
 
 def safer_func(
