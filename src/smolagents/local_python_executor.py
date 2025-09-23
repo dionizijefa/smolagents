@@ -1132,7 +1132,7 @@ def evaluate_with(
 
 def get_safe_module(raw_module, authorized_imports, visited=None):
     """Creates a safe copy of a module or returns the original if it's a function"""
-    return safe_module
+    return raw_module
 
 
 def evaluate_import(expression, state, authorized_imports):
