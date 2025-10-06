@@ -76,7 +76,7 @@ from .monitoring import (
     LogLevel,
     Monitor,
 )
-from .remote_executors import DockerExecutor, E2BExecutor, ModalExecutor, WasmExecutor
+from .remote_executors import DockerExecutor, E2BExecutor, LocalDockerExecutor, ModalExecutor, WasmExecutor
 from .tools import BaseTool, Tool, validate_tool_arguments
 from .utils import (
     AgentError,
@@ -1562,7 +1562,7 @@ class CodeAgent(MultiStepAgent):
                 "Caution: you set an authorization for all imports, meaning your agent can decide to import any package it deems necessary. This might raise issues if the package is not installed in your environment.",
                 level=LogLevel.INFO,
             )
-        if executor_type not in {"local", "e2b", "modal", "docker", "wasm"}:
+        if executor_type not in {"local", "e2b", "modal", "docker", "wasm", "local_docker"}:
             raise ValueError(f"Unsupported executor type: {executor_type}")
         self.executor_type = executor_type
         self.executor_kwargs: dict[str, Any] = executor_kwargs or {}
@@ -1581,11 +1581,15 @@ class CodeAgent(MultiStepAgent):
 
     def create_python_executor(self) -> PythonExecutor:
         if self.executor_type == "local":
+            normalized_kwargs = {
+                key: str(value) if isinstance(value, Path) else value
+                for key, value in self.executor_kwargs.items()
+            }
             return LocalPythonExecutor(
                 self.additional_authorized_imports,
-                **{"max_print_outputs_length": self.max_print_outputs_length} | self.executor_kwargs,
+                **{"max_print_outputs_length": self.max_print_outputs_length} | normalized_kwargs,
             )
-        else:
+        elif self.executor_type in {"e2b", "docker", "wasm", "modal"}:
             if self.managed_agents:
                 raise Exception("Managed agents are not yet supported with remote code execution.")
             remote_executors = {
@@ -1594,9 +1598,21 @@ class CodeAgent(MultiStepAgent):
                 "wasm": WasmExecutor,
                 "modal": ModalExecutor,
             }
+            normalized_kwargs = {
+                key: str(value) if isinstance(value, Path) else value
+                for key, value in self.executor_kwargs.items()
+            }
             return remote_executors[self.executor_type](
-                self.additional_authorized_imports, self.logger, **self.executor_kwargs
+                self.additional_authorized_imports, self.logger, **normalized_kwargs
             )
+        elif self.executor_type == "local_docker":
+            normalized_kwargs = {
+                key: str(value) if isinstance(value, Path) else value
+                for key, value in self.executor_kwargs.items()
+            }
+            return LocalDockerExecutor(**normalized_kwargs)
+        else:
+            raise ValueError(f"Unsupported executor type: {self.executor_type}")
 
     def initialize_system_prompt(self) -> str:
         system_prompt = populate_template(

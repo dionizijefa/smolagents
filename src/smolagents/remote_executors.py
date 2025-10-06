@@ -1,3 +1,4 @@
+from __future__ import annotations
 #!/usr/bin/env python
 # coding=utf-8
 
@@ -15,21 +16,27 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import base64
+from dataclasses import dataclass, field
 import inspect
+import io
 import json
 import os
+from pathlib import Path
 import pickle
 import re
 import secrets
+import shutil
 import subprocess
+import tarfile
 import tempfile
 import time
 from contextlib import closing
 from io import BytesIO
 from textwrap import dedent
-from typing import Any, Optional
+from typing import Any, List, Optional
 
 import PIL.Image
+import docker
 import requests
 from requests.exceptions import RequestException
 
@@ -40,7 +47,24 @@ from .tools import Tool, get_tools_definition_code
 from .utils import AgentError
 
 
-__all__ = ["E2BExecutor", "ModalExecutor", "DockerExecutor", "WasmExecutor"]
+__all__ = ["E2BExecutor", "ModalExecutor", "DockerExecutor", "WasmExecutor", "LocalDockerExecutor"]
+
+@dataclass
+class ExecutionError:
+    traceback: str
+
+
+@dataclass
+class ExecutionLogs:
+    stdout: List[str] = field(default_factory=list)
+
+
+@dataclass
+class ExecutionResult:
+    output: str = ""
+    error: Optional[ExecutionError] = None
+    logs: ExecutionLogs = field(default_factory=ExecutionLogs)
+
 
 
 try:
@@ -341,6 +365,7 @@ def _create_kernel_http(crate_kernel_endpoint: str, logger) -> str:
 class DockerExecutor(RemotePythonExecutor):
     """
     Executes Python code using Jupyter Kernel Gateway in a Docker container.
+    Adds host<->container bind mounts for inputs/outputs.
     """
 
     def __init__(
@@ -353,21 +378,39 @@ class DockerExecutor(RemotePythonExecutor):
         build_new_image: bool = True,
         container_run_kwargs: dict[str, Any] | None = None,
         dockerfile_content: str | None = None,
+
+        # NEW: mount-related convenience params
+        data_path: Optional[str] = None,         # host path to mount at /workspace/data (ro)
+        reference_path: Optional[str] = None,    # host path to mount at /workspace/reference (ro)
+        output_path: Optional[str] = None,       # host path to mount at /workspace/output (rw)
+        results_path: Optional[str] = None,      # host path to mount at /workspace/results (rw)
+        extra_mounts: Optional[list[tuple[str, str, str]]] = None,
+        # ^ list of (host_path, container_path, mode) e.g. [("/host/dir","/mnt/x","ro")]
+        ensure_dirs: bool = True,                # create host output/results dirs if missing
     ):
         """
         Initialize the Docker-based Jupyter Kernel Gateway executor.
 
         Args:
-            additional_imports: Additional imports to install.
-            logger: Logger to use.
-            host: Host to bind to.
-            port: Port to bind to.
-            image_name: Name of the Docker image to use. If the image doesn't exist, it will be built.
-            build_new_image: If True, the image will be rebuilt even if it already exists.
-            container_run_kwargs: Additional keyword arguments to pass to the Docker container run command.
-            dockerfile_content: Custom Dockerfile content. If None, uses default.
+            additional_imports: Additional imports to install inside the kernel env.
+            logger: Logger to use (expects .log / .log_error with level).
+            host: Host to bind to for Kernel Gateway.
+            port: Port to bind to for Kernel Gateway.
+            image_name: Docker image name/tag to use or build.
+            build_new_image: Force rebuild even if image exists.
+            container_run_kwargs: Extra kwargs passed to docker.containers.run.
+            dockerfile_content: Custom Dockerfile content.
+
+            data_path: Host path mounted read-only at /workspace/data.
+            reference_path: Host path mounted read-only at /workspace/reference.
+            output_path: Host path mounted read-write at /workspace/output.
+            results_path: Host path mounted read-write at /workspace/results.
+            extra_mounts: Additional (host, container, mode) mounts.
+            ensure_dirs: If True, create output/results dirs on host.
         """
         super().__init__(additional_imports, logger)
+
+        # --- imports guarded for nicer error message
         try:
             import docker
             from websocket import create_connection
@@ -375,71 +418,118 @@ class DockerExecutor(RemotePythonExecutor):
             raise ModuleNotFoundError(
                 "Please install 'docker' extra to use DockerExecutor: `pip install 'smolagents[docker]'`"
             )
+
         self.host = host
         self.port = port
         self.image_name = image_name
+        self.logger = logger
 
         self.dockerfile_content = dockerfile_content or dedent(
             """\
             FROM python:3.12-bullseye
 
-            RUN pip install jupyter_kernel_gateway jupyter_client ipykernel
+            RUN pip install --no-cache-dir jupyter_kernel_gateway jupyter_client ipykernel
 
             EXPOSE 8888
-            CMD ["jupyter", "kernelgateway", "--KernelGatewayApp.ip='0.0.0.0'", "--KernelGatewayApp.port=8888", "--KernelGatewayApp.allow_origin='*'"]
+            CMD ["jupyter", "kernelgateway", "--KernelGatewayApp.ip=0.0.0.0", "--KernelGatewayApp.port=8888", "--KernelGatewayApp.allow_origin=*"]
             """
         )
 
-        # Initialize Docker
+        # --- prepare mounts
+        def _p(p: Optional[str]) -> Optional[Path]:
+            return Path(p).expanduser().resolve() if p else None
+
+        data_p      = _p(data_path)
+        ref_p       = _p(reference_path)
+        out_p       = _p(output_path)
+        res_p       = _p(results_path)
+
+        if ensure_dirs:
+            # inputs are optional; outputs we often want to exist
+            for d in [out_p, res_p]:
+                if d:
+                    d.mkdir(parents=True, exist_ok=True)
+
+        self._mounts = []  # (host_path: Path, container_path: str, mode: str)
+
+        if data_p:
+            self._mounts.append((data_p, "/workspace/data", "ro"))
+        if ref_p:
+            self._mounts.append((ref_p, "/workspace/reference", "ro"))
+        if out_p:
+            self._mounts.append((out_p, "/workspace/output", "rw"))
+        if res_p:
+            self._mounts.append((res_p, "/workspace/results", "rw"))
+
+        if extra_mounts:
+            for host, container, mode in extra_mounts:
+                self._mounts.append((_p(host), container, mode))
+
+        # --- Initialize Docker
         try:
             self.client = docker.from_env()
         except docker.errors.DockerException as e:
             raise RuntimeError("Could not connect to Docker daemon: make sure Docker is running.") from e
 
-        # Build and start container
+        # --- Build and start container
         try:
-            # Check if image exists, unless forced to rebuild
+            # Build (if needed)
             if not build_new_image:
                 try:
                     self.client.images.get(self.image_name)
                     self.logger.log(f"Using existing Docker image: {self.image_name}", level=LogLevel.INFO)
-                except docker.errors.ImageNotFound:
+                except self.client.api.images().__class__.ImageNotFound if hasattr(self.client, "api") else Exception:  # defensive
                     self.logger.log(f"Image {self.image_name} not found, building...", level=LogLevel.INFO)
                     build_new_image = True
 
             if build_new_image:
                 self.logger.log(f"Building Docker image {self.image_name}...", level=LogLevel.INFO)
                 dockerfile_obj = BytesIO(self.dockerfile_content.encode("utf-8"))
-                _, build_logs = self.client.images.build(fileobj=dockerfile_obj, tag=self.image_name)
+                _, build_logs = self.client.images.build(fileobj=dockerfile_obj, tag=self.image_name, rm=True, forcerm=True)
                 for log_chunk in build_logs:
-                    # Only log non-empty messages
                     if log_message := log_chunk.get("stream", "").rstrip():
                         self.logger.log(log_message, level=LogLevel.DEBUG)
 
             self.logger.log(f"Starting container on {host}:{port}...", level=LogLevel.INFO)
-            # Create base container parameters
-            container_kwargs = {}
+
+            # Base container kwargs
+            container_kwargs: dict[str, Any] = {}
             if container_run_kwargs:
                 container_kwargs.update(container_run_kwargs)
 
-            # Ensure required port mapping and background running
+            # --- Ensure Kernel Gateway port mapping + detach
             if not isinstance(container_kwargs.get("ports"), dict):
                 container_kwargs["ports"] = {}
             container_kwargs["ports"]["8888/tcp"] = (host, port)
             container_kwargs["detach"] = True
 
+            # --- Merge volumes
+            # docker-py expects: {"host_path": {"bind": "/in/container", "mode": "ro|rw"}, ...}
+            volumes = container_kwargs.get("volumes", {})
+            for host_path, container_path, mode in self._mounts:
+                if host_path is None:
+                    continue
+                # Docker Desktop on Windows: ensure drive-letter style is acceptable; Path.resolve() usually OK.
+                volumes[str(host_path)] = {"bind": container_path, "mode": mode}
+            if volumes:
+                container_kwargs["volumes"] = volumes
+
+            # You may also add extra_hosts if needed:
+            # container_kwargs.setdefault("extra_hosts", {})["host.docker.internal"] = "host-gateway"
+
             self.container = self.client.containers.run(self.image_name, **container_kwargs)
 
+            # Wait for running
             retries = 0
-            while self.container.status != "running" and retries < 5:
+            while self.container.status != "running" and retries < 10:
                 self.logger.log(f"Container status: {self.container.status}, waiting...", level=LogLevel.INFO)
-                time.sleep(1)
+                time.sleep(0.8)
                 self.container.reload()
                 retries += 1
 
             self.base_url = f"http://{host}:{port}"
 
-            # Wait for Jupyter to start
+            # Wait for Jupyter
             self._wait_for_server()
 
             # Create new kernel via HTTP
@@ -450,14 +540,15 @@ class DockerExecutor(RemotePythonExecutor):
 
             self.installed_packages = self.install_packages(additional_imports)
             self.logger.log(
-                f"Container {self.container.short_id} is running with kernel {self.kernel_id}", level=LogLevel.INFO
+                f"Container {self.container.short_id} is running with kernel {self.kernel_id}",
+                level=LogLevel.INFO,
             )
 
         except Exception as e:
             self.cleanup()
             raise RuntimeError(f"Failed to initialize Jupyter kernel: {e}") from e
 
-    def run_code_raise_errors(self, code: str) -> CodeOutput:
+    def run_code_raise_errors(self, code: str) -> "CodeOutput":
         return _websocket_run_code_raise_errors(code, self.ws, self.logger)
 
     def cleanup(self):
@@ -479,16 +570,17 @@ class DockerExecutor(RemotePythonExecutor):
     def _wait_for_server(self):
         retries = 0
         jupyter_ready = False
-        while not jupyter_ready and retries < 10:
+        while not jupyter_ready and retries < 20:
             try:
-                if requests.get(f"{self.base_url}/api/kernelspecs", timeout=2).status_code == 200:
+                r = requests.get(f"{self.base_url}/api/kernelspecs", timeout=2)
+                if r.status_code == 200:
                     jupyter_ready = True
                 else:
                     self.logger.log("Jupyter not ready, waiting...", level=LogLevel.INFO)
             except requests.RequestException:
                 self.logger.log("Jupyter not ready, waiting...", level=LogLevel.INFO)
             if not jupyter_ready:
-                time.sleep(1)
+                time.sleep(0.8)
                 retries += 1
 
 
@@ -913,3 +1005,265 @@ class WasmExecutor(RemotePythonExecutor):
           });
         });
         """)
+
+class LocalDockerExecutor:
+    """
+    Local Docker executor that:
+      - builds (or reuses) a micromamba-based image,
+      - copies inputs (data/, reference/) into /workspace,
+      - runs Python code inside the container,
+      - copies /workspace/output and /workspace/results back to the host.
+    """
+
+    def __init__(
+        self,
+        *,
+        image_name: str = "micromamba-executor:latest",
+        build_new_image: bool = True,
+        dockerfile_content: Optional[str] = None,
+        container_run_kwargs: Optional[Dict[str, Any]] = None,
+        logger: Optional[Any] = None,  # expects .info/.debug/.error or print-like
+        python_bin: str = "/opt/conda/bin/python",  # micromamba base default
+    ):
+        self.client = docker.from_env()
+        self.image_name = image_name
+        self.build_new_image = build_new_image
+        self.python_bin = python_bin
+        self.container_run_kwargs = container_run_kwargs or {}
+        self.container = None
+        self.logger = logger
+        self._dockerfile_content = dockerfile_content or dedent(
+            """\
+            FROM mambaorg/micromamba
+
+            ARG MAMBA_DOCKERFILE_ACTIVATE=1
+            WORKDIR /workspace
+
+            # minimal, pin Python; add what you need here (pip, uv, etc.)
+            RUN micromamba install -y -n base -c conda-forge python=3.13 && \
+                micromamba clean -a -y
+
+            # Optionally: create output/results dirs to ensure they exist
+            RUN mkdir -p /workspace/output /workspace/results /workspace/data /workspace/reference
+            """
+        )
+
+        self._ensure_image()
+
+    # ---------- Logging helpers ----------
+    def _log(self, msg: str, level: str = "info"):
+        if self.logger:
+            fn = getattr(self.logger, level, None)
+            if callable(fn):
+                fn(msg)
+                return
+        print(msg)
+
+    # ---------- Image build / ensure ----------
+    def _ensure_image(self):
+        image_found = False
+        if not self.build_new_image:
+            try:
+                self.client.images.get(self.image_name)
+                image_found = True
+                self._log(f"Using existing image: {self.image_name}")
+            except docker.errors.ImageNotFound:
+                self._log(f"Image {self.image_name} not found; will build.")
+
+        if self.build_new_image or not image_found:
+            self._log(f"Building Docker image {self.image_name}...")
+            dockerfile_bytes = io.BytesIO(self._dockerfile_content.encode("utf-8"))
+            image, build_logs = self.client.images.build(
+                fileobj=dockerfile_bytes,
+                tag=self.image_name,
+                rm=True,
+                forcerm=True,
+                pull=False,
+            )
+            for line in build_logs:
+                stream = line.get("stream")
+                if stream:
+                    s = stream.strip()
+                    if s:
+                        self._log(s, level="debug")
+
+    # ---------- Container lifecycle ----------
+    def _start_container(self, env: Optional[Dict[str, str]] = None):
+        # Safe defaults; caller can override via container_run_kwargs
+        run_kwargs = dict(
+            command="tail -f /dev/null",
+            detach=True,
+            tty=True,
+            working_dir="/workspace",
+            # Drop capabilities by default (you can loosen if needed)
+            cap_drop=["ALL"],
+            environment=env or {},
+            # Add host-gateway if you need to call back to host services
+            extra_hosts={"host.docker.internal": "host-gateway"},
+        )
+        run_kwargs.update(self.container_run_kwargs or {})
+
+        self.container = self.client.containers.run(self.image_name, **run_kwargs)
+        # Wait a moment and confirm it's up
+        retries = 0
+        while retries < 10:
+            self.container.reload()
+            if self.container.status == "running":
+                break
+            time.sleep(0.4)
+            retries += 1
+        if self.container.status != "running":
+            raise RuntimeError(f"Container failed to start (status={self.container.status}).")
+        self._log(f"Container started: {self.container.short_id}")
+
+    def cleanup(self):
+        if self.container:
+            try:
+                self._log(f"Stopping container {self.container.short_id}...")
+                self.container.stop(timeout=5)
+            except docker.errors.NotFound:
+                pass
+            except Exception as e:
+                self._log(f"Error during container stop: {e}", level="error")
+            try:
+                self._log(f"Removing container {self.container.short_id}...")
+                self.container.remove(force=True)
+            except Exception as e:
+                self._log(f"Error during container remove: {e}", level="error")
+            finally:
+                self.container = None
+
+    # ---------- Tar copy helpers ----------
+    def _copy_dir_to_container(self, host_dir: Path, container_dest: Path):
+        if not host_dir.exists() or not host_dir.is_dir():
+            return
+        # Create a tar with the directory contents (as a top-level folder named like container_dest.name)
+        archive_stream = io.BytesIO()
+        with tarfile.open(fileobj=archive_stream, mode="w") as tar:
+            tar.add(str(host_dir), arcname=container_dest.name)
+        archive_stream.seek(0)
+        # Ensure parent exists and remove previous target
+        self.container.exec_run(["mkdir", "-p", str(container_dest.parent)])
+        self.container.exec_run(["rm", "-rf", str(container_dest)])
+        self.container.put_archive(str(container_dest.parent), archive_stream.getvalue())
+
+    def _copy_dir_from_container(self, container_src: Path, host_dest: Path):
+        try:
+            stream, _ = self.container.get_archive(str(container_src))
+        except docker.errors.NotFound:
+            return
+
+        tmpdir = Path(tempfile.mkdtemp(prefix="dockercopy_"))
+        try:
+            buf = io.BytesIO()
+            for chunk in stream:
+                buf.write(chunk)
+            buf.seek(0)
+            with tarfile.open(fileobj=buf, mode="r") as tar:
+                # SECURITY NOTE: tar.extractall is used inside tmp dir which we control.
+                tar.extractall(path=tmpdir)
+
+            extracted_root = tmpdir / container_src.name
+            host_dest = host_dest.resolve()
+            if host_dest.exists():
+                shutil.rmtree(host_dest)
+            if extracted_root.is_dir():
+                shutil.copytree(extracted_root, host_dest)
+            elif extracted_root.exists():
+                host_dest.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(extracted_root, host_dest)
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    # ---------- Public API ----------
+    def run_code(
+        self,
+        code: str,
+        *,
+        task_data_path: Optional[str] = None,   # host root with data/ and reference/
+        output_path: Optional[str] = None,      # host dir to receive /workspace/output
+        results_path: Optional[str] = None,     # host dir to receive /workspace/results
+        env: Optional[Dict[str, str]] = None,
+        log_file_dir: Optional[str] = None,     # where to write docker_stdout.log on host
+        python_bin: Optional[str] = None,       # override interpreter inside container
+        ensure_dirs: bool = True,
+    ) -> ExecutionResult:
+        """
+        Execute Python code inside the container.
+
+        Expected container paths:
+          - /workspace/data        (copied from {task_data_path}/data if exists)
+          - /workspace/reference   (copied from {task_data_path}/reference if exists)
+          - /workspace/output      (copied back to output_path)
+          - /workspace/results     (copied back to results_path)
+        """
+        # Expand/normalize host paths
+        output_root = Path(output_path).expanduser().resolve() if output_path else None
+        results_root = Path(results_path).expanduser().resolve() if results_path else None
+        inputs_root = Path(task_data_path).expanduser().resolve() if task_data_path else None
+
+        # Choose a sensible place for the log file
+        log_dir_candidates = [p.parent for p in (output_root, results_root, inputs_root) if p is not None]
+        log_dir = Path(log_file_dir).expanduser().resolve() if log_file_dir else (log_dir_candidates[0] if log_dir_candidates else Path.cwd())
+        if ensure_dirs:
+            log_dir.mkdir(parents=True, exist_ok=True)
+            if output_root:
+                output_root.mkdir(parents=True, exist_ok=True)
+            if results_root:
+                results_root.mkdir(parents=True, exist_ok=True)
+        log_file_path = log_dir / "docker_stdout.log"
+
+        # Start container
+        if not self.container:
+            self._start_container(env=env)
+
+        # Copy inputs into container
+        if inputs_root:
+            self._copy_dir_to_container(inputs_root / "data", Path("/workspace/data"))
+            self._copy_dir_to_container(inputs_root / "reference", Path("/workspace/reference"))
+
+        # Ensure output/results dirs exist in container
+        self.container.exec_run(["mkdir", "-p", "/workspace/output", "/workspace/results"])
+
+        # Execute the code
+        pybin = python_bin or self.python_bin
+        try:
+            exec_result = self.container.exec_run(
+                cmd=[pybin, "-u", "-c", code],
+                user="root",            # flip to non-root if you prefer
+                environment=env or {},
+                stream=True,
+                demux=True,
+            )
+
+            out_chunks: List[str] = []
+            with log_file_path.open("w", encoding="utf-8") as lf:
+                for stdout_chunk, stderr_chunk in exec_result.output:
+                    if stdout_chunk:
+                        s = stdout_chunk.decode(errors="replace")
+                        out_chunks.append(s)
+                        lf.write(s)
+                        lf.flush()
+                    if stderr_chunk:
+                        s = stderr_chunk.decode(errors="replace")
+                        out_chunks.append(s)
+                        lf.write(s)
+                        lf.flush()
+
+            combined = "".join(out_chunks)
+            exit_code = exec_result.exit_code
+
+            # Copy results back
+            if output_root:
+                self._copy_dir_from_container(Path("/workspace/output"), output_root)
+            if results_root:
+                self._copy_dir_from_container(Path("/workspace/results"), results_root)
+
+            if exit_code != 0:
+                return ExecutionResult(output=combined, error=ExecutionError(traceback=combined), logs=ExecutionLogs(stdout=[combined] if combined else []))
+            return ExecutionResult(output=combined, logs=ExecutionLogs(stdout=[combined] if combined else []))
+
+        except Exception as e:
+            return ExecutionResult(error=ExecutionError(traceback=str(e)))
+        # NOTE: no auto-cleanup here so you can inspect the container if needed.
+        # Call .cleanup() explicitly when done.
