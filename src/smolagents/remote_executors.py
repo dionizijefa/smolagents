@@ -94,15 +94,15 @@ class RemotePythonExecutor(PythonExecutor):
     def send_tools(self, tools: dict[str, Tool]):
         if "final_answer" in tools:
             self._patch_final_answer_with_exception(tools["final_answer"])
-        # Install tool packages
-        packages_to_install = {
-            pkg
-            for tool in tools.values()
-            for pkg in tool.to_dict()["requirements"]
-            if pkg not in self.installed_packages + ["smolagents"]
-        }
-        if packages_to_install:
-            self.installed_packages += self.install_packages(list(packages_to_install))
+        # # Install tool packages
+        # packages_to_install = {
+        #     pkg
+        #     for tool in tools.values()
+        #     for pkg in tool.to_dict()["requirements"]
+        #     if pkg not in self.installed_packages + ["smolagents"]
+        # }
+        # if packages_to_install:
+        #     self.installed_packages += self.install_packages(list(packages_to_install))
         # Get tool definitions
         code = get_tools_definition_code(tools)
         if code:
@@ -379,14 +379,16 @@ class DockerExecutor(RemotePythonExecutor):
         container_run_kwargs: dict[str, Any] | None = None,
         dockerfile_content: str | None = None,
 
-        # NEW: mount-related convenience params
-        data_path: Optional[str] = None,         # host path to mount at /workspace/data (ro)
-        reference_path: Optional[str] = None,    # host path to mount at /workspace/reference (ro)
-        output_path: Optional[str] = None,       # host path to mount at /workspace/output (rw)
-        results_path: Optional[str] = None,      # host path to mount at /workspace/results (rw)
+        data_path: Optional[str] = None,      
+        reference_path: Optional[str] = None,
+        output_path: Optional[str] = None,
+        results_path: Optional[str] = None,
         extra_mounts: Optional[list[tuple[str, str, str]]] = None,
-        # ^ list of (host_path, container_path, mode) e.g. [("/host/dir","/mnt/x","ro")]
-        ensure_dirs: bool = True,                # create host output/results dirs if missing
+        ensure_dirs: bool = True,
+        cleanup_labels: Optional[dict[str, str]] = None,
+        cleanup_container_name: Optional[str] = None,
+        cleanup_host: Optional[str] = None,
+        cleanup_port: Optional[int] = None,
     ):
         """
         Initialize the Docker-based Jupyter Kernel Gateway executor.
@@ -407,6 +409,11 @@ class DockerExecutor(RemotePythonExecutor):
             results_path: Host path mounted read-write at /workspace/results.
             extra_mounts: Additional (host, container, mode) mounts.
             ensure_dirs: If True, create output/results dirs on host.
+            cleanup_labels: Optional labels used to identify pre-existing containers to stop/remove before
+                starting a new one.
+            cleanup_container_name: Specific container name to clean up before starting a new container.
+            cleanup_host: Host IP to use when cleaning up containers bound to the same port.
+            cleanup_port: Host port to use when cleaning up containers bound to the same port.
         """
         super().__init__(additional_imports, logger)
 
@@ -423,6 +430,37 @@ class DockerExecutor(RemotePythonExecutor):
         self.port = port
         self.image_name = image_name
         self.logger = logger
+        cleanup_host = cleanup_host or host
+        cleanup_port = cleanup_port or port
+        container_ports = container_run_kwargs.get("ports") if container_run_kwargs else None
+        if container_run_kwargs and cleanup_labels is None:
+            cleanup_labels = container_run_kwargs.get("labels")
+
+        if isinstance(container_ports, dict):
+            bound = container_ports.get("8888/tcp")
+            if isinstance(bound, tuple) and len(bound) == 2:
+                cleanup_host, cleanup_port = bound
+            elif isinstance(bound, list) and bound:
+                first_binding = bound[0]
+                if isinstance(first_binding, tuple) and len(first_binding) == 2:
+                    cleanup_host, cleanup_port = first_binding
+                elif isinstance(first_binding, dict):
+                    cleanup_host = first_binding.get("HostIp", cleanup_host)
+                    try:
+                        cleanup_port = int(first_binding.get("HostPort", cleanup_port))
+                    except (TypeError, ValueError):
+                        pass
+            elif isinstance(bound, dict):
+                cleanup_host = bound.get("HostIp", cleanup_host)
+                try:
+                    cleanup_port = int(bound.get("HostPort", cleanup_port))
+                except (TypeError, ValueError):
+                    pass
+
+        try:
+            cleanup_port = int(cleanup_port)
+        except (TypeError, ValueError):
+            cleanup_port = port
 
         self.dockerfile_content = dockerfile_content or dedent(
             """\
@@ -471,6 +509,13 @@ class DockerExecutor(RemotePythonExecutor):
         except docker.errors.DockerException as e:
             raise RuntimeError("Could not connect to Docker daemon: make sure Docker is running.") from e
 
+        self._cleanup_stale_containers(
+            labels=cleanup_labels,
+            container_name=cleanup_container_name,
+            host=cleanup_host,
+            port=cleanup_port,
+        )
+
         # --- Build and start container
         try:
             # Build (if needed)
@@ -478,7 +523,7 @@ class DockerExecutor(RemotePythonExecutor):
                 try:
                     self.client.images.get(self.image_name)
                     self.logger.log(f"Using existing Docker image: {self.image_name}", level=LogLevel.INFO)
-                except self.client.api.images().__class__.ImageNotFound if hasattr(self.client, "api") else Exception:  # defensive
+                except (docker.errors.ImageNotFound, docker.errors.NotFound):
                     self.logger.log(f"Image {self.image_name} not found, building...", level=LogLevel.INFO)
                     build_new_image = True
 
@@ -554,18 +599,89 @@ class DockerExecutor(RemotePythonExecutor):
     def cleanup(self):
         """Clean up the Docker container and resources."""
         try:
-            if hasattr(self, "container"):
+            if hasattr(self, "container") and self.container:
                 self.logger.log(f"Stopping and removing container {self.container.short_id}...", level=LogLevel.INFO)
                 self.container.stop()
                 self.container.remove()
                 self.logger.log("Container cleanup completed", level=LogLevel.INFO)
-                del self.container
+                self.container = None
+        except docker.errors.NotFound:
+            self.container = None
         except Exception as e:
             self.logger.log_error(f"Error during cleanup: {e}")
 
     def delete(self):
         """Ensure cleanup on deletion."""
         self.cleanup()
+
+    def _cleanup_stale_containers(
+        self,
+        *,
+        labels: Optional[dict[str, str]] = None,
+        container_name: Optional[str] = None,
+        host: Optional[str] = None,
+        port: Optional[int] = None,
+    ) -> None:
+        if not (labels or container_name):
+            return
+
+        try:
+            candidates = self.client.containers.list(all=True)
+        except Exception as exc:
+            self.logger.log_error(f"Unable to list containers for cleanup: {exc}")
+            return
+
+        label_items = tuple(labels.items()) if labels else tuple()
+
+        for container in candidates:
+            try:
+                container.reload()
+            except docker.errors.APIError:
+                continue
+            remove = False
+            if label_items:
+                container_labels = container.labels or {}
+                if all(container_labels.get(key) == value for key, value in label_items):
+                    remove = True
+            if not remove and container_name and container.name == container_name:
+                remove = True
+            if not remove and host and port:
+                ports = container.attrs.get("NetworkSettings", {}).get("Ports", {})
+                bindings = ports.get("8888/tcp")
+                if bindings:
+                    try:
+                        remove = any(
+                            binding.get("HostIp") == host
+                            and int(binding.get("HostPort", 0)) == port
+                            for binding in bindings
+                        )
+                    except (TypeError, ValueError):
+                        remove = False
+
+            if not remove:
+                continue
+
+            try:
+                self.logger.log(
+                    f"Cleaning up stale container {container.name} ({container.short_id})",
+                    level=LogLevel.INFO,
+                )
+                container.stop(timeout=5)
+            except docker.errors.APIError as exc:
+                self.logger.log_error(f"Failed stopping container {container.name}: {exc}")
+            except docker.errors.NotFound:
+                continue
+            except Exception as exc:  # pragma: no cover - defensive
+                self.logger.log_error(f"Unexpected error stopping container {container.name}: {exc}")
+
+            try:
+                container.remove(force=True)
+            except docker.errors.APIError as exc:
+                self.logger.log_error(f"Failed removing container {container.name}: {exc}")
+            except docker.errors.NotFound:
+                continue
+            except Exception as exc:  # pragma: no cover - defensive
+                self.logger.log_error(f"Unexpected error removing container {container.name}: {exc}")
 
     def _wait_for_server(self):
         retries = 0

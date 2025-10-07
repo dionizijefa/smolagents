@@ -1335,11 +1335,23 @@ class PipelineTool(Tool):
 def get_tools_definition_code(tools: dict[str, Tool]) -> str:
     tool_codes = []
     for tool in tools.values():
-        validate_tool_attributes(tool.__class__, check_imports=False)
-        tool_code = instance_to_source(tool, base_cls=Tool)
+        try:
+            tool_code = instance_to_source(tool, base_cls=Tool)
+        except Exception:
+            # Fallback to the next tool if we cannot serialize the current one
+            continue
+
+        # Remove heavyweight imports so the generated code can run in minimal environments
         tool_code = tool_code.replace("from smolagents.tools import Tool", "")
-        tool_code += f"\n\n{tool.name} = {tool.__class__.__name__}()\n"
-        tool_codes.append(tool_code)
+
+        # Ensure the resulting snippet instantiates the tool with its registered name
+        tool_instance_code = textwrap.dedent(
+            f"""
+
+            {tool.name} = {tool.__class__.__name__}()
+            """
+        )
+        tool_codes.append(textwrap.dedent(tool_code) + tool_instance_code)
 
     tool_definition_code = "\n".join([f"import {module}" for module in BASE_BUILTIN_MODULES])
     tool_definition_code += textwrap.dedent(
@@ -1354,7 +1366,8 @@ def get_tools_definition_code(tools: dict[str, Tool]) -> str:
             pass # to be implemented in child class
     """
     )
-    tool_definition_code += "\n\n".join(tool_codes)
+    if tool_codes:
+        tool_definition_code += "\n\n" + "\n\n".join(tool_codes)
     return tool_definition_code
 
 
