@@ -53,7 +53,6 @@ ERRORS = {
 }
 
 DEFAULT_MAX_LEN_OUTPUT = 50000
-MAX_OPERATIONS = 10000000
 MAX_WHILE_ITERATIONS = 1000000
 ALLOWED_DUNDER_METHODS = ["__init__", "__str__", "__repr__"]
 
@@ -1312,11 +1311,6 @@ def evaluate_ast(
             The list of modules that can be imported by the code. By default, only a few safe modules are allowed.
             If it contains "*", it will authorize any import. Use this at your own risk!
     """
-    if state.setdefault("_operations_count", {"counter": 0})["counter"] >= MAX_OPERATIONS:
-        raise InterpreterError(
-            f"Reached the max number of operations of {MAX_OPERATIONS}. Maybe there is an infinite loop somewhere in the code, or you're just asking too many calculations."
-        )
-    state["_operations_count"]["counter"] += 1
     common_params = (state, static_tools, custom_tools, authorized_imports)
     if isinstance(expression, ast.Assign):
         # Assignment -> we evaluate the assignment which should update the state
