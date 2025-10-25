@@ -1581,6 +1581,8 @@ class LocalPythonExecutor(PythonExecutor):
         return
 
     def __call__(self, code_action: str) -> CodeOutput:
+        if re.search(r"(?:conda|mamba)\s+activate\s+base", code_action, flags=re.IGNORECASE):
+            raise InterpreterError("base environment not allowed; use bioinformatics or create a new environment")
         output, is_final_answer = evaluate_python_code(
             code_action,
             static_tools=self.static_tools,
